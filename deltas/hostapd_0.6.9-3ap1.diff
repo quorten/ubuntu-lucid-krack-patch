@@ -1,0 +1,510 @@
+diff -u hostapd-0.6.9/debian/changelog hostapd-0.6.9/debian/changelog
+--- hostapd-0.6.9/debian/changelog
++++ hostapd-0.6.9/debian/changelog
+@@ -1,3 +1,9 @@
++hostapd (1:0.6.9-3ap1) unstable; urgency=low
++
++  * Apply backport patches to fix KRACK vulnerability.
++
++ -- Andrew <andrew@localhost>  Sat, 28 Oct 2017 11:04:47 -0500
++
+ hostapd (1:0.6.9-3) unstable; urgency=low
+ 
+   * Change Maintainer to pkg-wpa-devel team and add Reinhard and myself
+diff -u hostapd-0.6.9/debian/patches/series hostapd-0.6.9/debian/patches/series
+--- hostapd-0.6.9/debian/patches/series
++++ hostapd-0.6.9/debian/patches/series
+@@ -2,0 +3,4 @@
++2017-1/0001-hostapd-Avoid-key-reinstallation-in-FT-handshake.patch
++2017-1/0002-Prevent-reinstallation-of-an-already-in-use-group-ke.patch
++2017-1/0004-Fix-PTK-rekeying-to-generate-a-new-ANonce.patch
++2017-1/0009-FT-Do-not-allow-multiple-Reassociation-Response-fram.patch
+only in patch2:
+unchanged:
+--- hostapd-0.6.9.orig/debian/patches/2017-1/0001-hostapd-Avoid-key-reinstallation-in-FT-handshake.patch
++++ hostapd-0.6.9/debian/patches/2017-1/0001-hostapd-Avoid-key-reinstallation-in-FT-handshake.patch
+@@ -0,0 +1,107 @@
++This patch has been modified for compatibility with `hostapd'
++from Ubuntu 10.04 LTS.
++
++Original message header below.
++===================================================================
++
++From fae4ceb757da370ebd1870762fd38fb39ee3d0a2 Mon Sep 17 00:00:00 2001
++From: Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
++Date: Fri, 14 Jul 2017 15:15:35 +0200
++Subject: [PATCH 01/10] hostapd: Avoid key reinstallation in FT handshake
++
++Do not reinstall TK to the driver during Reassociation Response frame
++processing if the first attempt of setting the TK succeeded. This avoids
++issues related to clearing the TX/RX PN that could result in reusing
++same PN values for transmitted frames (e.g., due to CCM nonce reuse and
++also hitting replay protection on the receiver) and accepting replayed
++frames on RX side.
++
++This issue was introduced by the commit
++0e84c25434e6a1f283c7b4e62e483729085b78d2 ('FT: Fix PTK configuration in
++authenticator') which allowed wpa_ft_install_ptk() to be called multiple
++times with the same PTK. While the second configuration attempt is
++needed with some drivers, it must be done only if the first attempt
++failed.
++
++Signed-off-by: Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
++---
++ src/ap/wpa_auth.c    |  8 ++++++++
++ src/ap/wpa_auth.h    |  1 +
++ src/ap/wpa_auth_ft.c | 10 ++++++++++
++ src/ap/wpa_auth_i.h  |  1 +
++ 4 files changed, 20 insertions(+)
++
++diff -Naurp hostapd-0.6.9.orig/hostapd/wpa_auth_i.h hostapd-0.6.9/hostapd/wpa_auth_i.h
++--- hostapd-0.6.9.orig/hostapd/wpa_auth_i.h	2017-10-28 10:59:08.285458669 -0500
+++++ hostapd-0.6.9/hostapd/wpa_auth_i.h	2017-10-28 10:59:20.786550093 -0500
++@@ -67,6 +67,7 @@ struct wpa_state_machine {
++ 	struct wpa_ptk PTK;
++ 	Boolean PTK_valid;
++ 	Boolean pairwise_set;
+++	Boolean tk_already_set;
++ 	int keycount;
++ 	Boolean Pair;
++ 	struct {
++diff -Naurp hostapd-0.6.9.orig/hostapd/wpa.c hostapd-0.6.9/hostapd/wpa.c
++--- hostapd-0.6.9.orig/hostapd/wpa.c	2017-10-28 10:59:08.285458669 -0500
+++++ hostapd-0.6.9/hostapd/wpa.c	2017-10-28 10:59:20.786550093 -0500
++@@ -2328,6 +2328,14 @@ int wpa_auth_sta_wpa_version(struct wpa_
++ }
++ 
++ 
+++int wpa_auth_sta_ft_tk_already_set(struct wpa_state_machine *sm)
+++{
+++	if (!sm || !wpa_key_mgmt_ft(sm->wpa_key_mgmt))
+++		return 0;
+++	return sm->tk_already_set;
+++}
+++
+++
++ int wpa_auth_sta_clear_pmksa(struct wpa_state_machine *sm,
++ 			     struct rsn_pmksa_cache_entry *entry)
++ {
++diff -Naurp hostapd-0.6.9.orig/hostapd/wpa_ft.c hostapd-0.6.9/hostapd/wpa_ft.c
++--- hostapd-0.6.9.orig/hostapd/wpa_ft.c	2017-10-28 10:59:08.285458669 -0500
+++++ hostapd-0.6.9/hostapd/wpa_ft.c	2017-10-28 10:59:20.786550093 -0500
++@@ -690,6 +690,14 @@ static void wpa_ft_install_ptk(struct wp
++ 	} else
++ 		return;
++ 
+++	if (sm->tk_already_set) {
+++		/* Must avoid TK reconfiguration to prevent clearing of TX/RX
+++		 * PN in the driver */
+++		wpa_printf(MSG_DEBUG,
+++			   "FT: Do not re-install same PTK to the driver");
+++		return;
+++	}
+++
++ 	/* FIX: add STA entry to kernel/driver here? The set_key will fail
++ 	 * most likely without this.. At the moment, STA entry is added only
++ 	 * after association has been completed. Alternatively, could
++@@ -701,6 +709,7 @@ static void wpa_ft_install_ptk(struct wp
++ 
++ 	/* FIX: MLME-SetProtection.Request(TA, Tx_Rx) */
++ 	sm->pairwise_set = TRUE;
+++	sm->tk_already_set = TRUE;
++ }
++ 
++ 
++@@ -811,6 +820,7 @@ static u16 wpa_ft_process_auth_req(struc
++ 			(u8 *) &sm->PTK, sizeof(sm->PTK));
++ 	wpa_hexdump(MSG_DEBUG, "FT: PTKName", ptk_name, WPA_PMK_NAME_LEN);
++ 
+++	sm->tk_already_set = FALSE;
++ 	wpa_ft_install_ptk(sm);
++ 
++ 	buflen = 2 + sizeof(struct rsn_mdie) + 2 + sizeof(struct rsn_ftie) +
++diff -Naurp hostapd-0.6.9.orig/hostapd/wpa.h hostapd-0.6.9/hostapd/wpa.h
++--- hostapd-0.6.9.orig/hostapd/wpa.h	2017-10-28 10:59:08.285458669 -0500
+++++ hostapd-0.6.9/hostapd/wpa.h	2017-10-28 10:59:20.786550093 -0500
++@@ -249,6 +249,7 @@ int wpa_auth_pairwise_set(struct wpa_sta
++ int wpa_auth_get_pairwise(struct wpa_state_machine *sm);
++ int wpa_auth_sta_key_mgmt(struct wpa_state_machine *sm);
++ int wpa_auth_sta_wpa_version(struct wpa_state_machine *sm);
+++int wpa_auth_sta_ft_tk_already_set(struct wpa_state_machine *sm);
++ int wpa_auth_sta_clear_pmksa(struct wpa_state_machine *sm,
++ 			     struct rsn_pmksa_cache_entry *entry);
++ struct rsn_pmksa_cache_entry *
+only in patch2:
+unchanged:
+--- hostapd-0.6.9.orig/debian/patches/2017-1/0002-Prevent-reinstallation-of-an-already-in-use-group-ke.patch
++++ hostapd-0.6.9/debian/patches/2017-1/0002-Prevent-reinstallation-of-an-already-in-use-group-ke.patch
+@@ -0,0 +1,214 @@
++This patch has been modified for compatibility with `wpasupplicant'
++from Ubuntu 10.04 LTS.
++
++Original message header below.
++===================================================================
++
++From d703108d74fb1bc98f48490c513c7061dd8fbe9e Mon Sep 17 00:00:00 2001
++From: Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
++Date: Wed, 12 Jul 2017 16:03:24 +0200
++Subject: [PATCH 02/10] Prevent reinstallation of an already in-use group key
++
++Track the current GTK and IGTK that is in use and when receiving a
++(possibly retransmitted) Group Message 1 or WNM-Sleep Mode Response, do
++not install the given key if it is already in use. This prevents an
++attacker from trying to trick the client into resetting or lowering the
++sequence counter associated to the group key.
++
++Signed-off-by: Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
++---
++ src/common/wpa_common.h |  11 +++++
++ src/rsn_supp/wpa.c      | 116 ++++++++++++++++++++++++++++++------------------
++ src/rsn_supp/wpa_i.h    |   4 ++
++ 3 files changed, 87 insertions(+), 44 deletions(-)
++
++diff -Naurp wpasupplicant-0.6.9.orig/src/common/wpa_common.h wpasupplicant-0.6.9/src/common/wpa_common.h
++--- wpasupplicant-0.6.9.orig/src/common/wpa_common.h	2017-10-22 15:59:15.163356687 -0500
+++++ wpasupplicant-0.6.9/src/common/wpa_common.h	2017-10-22 15:57:05.605249918 -0500
++@@ -105,6 +105,7 @@
++ 
++ #ifdef CONFIG_IEEE80211W
++ #define WPA_IGTK_LEN 16
+++#define WPA_IGTK_MAX_LEN 32
++ #endif /* CONFIG_IEEE80211W */
++ 
++ 
++@@ -177,6 +178,17 @@ struct wpa_ptk {
++ 	} u;
++ } STRUCT_PACKED;
++ 
+++struct wpa_gtk {
+++	u8 gtk[WPA_GTK_MAX_LEN];
+++	size_t gtk_len;
+++};
+++
+++#ifdef CONFIG_IEEE80211W
+++struct wpa_igtk {
+++	u8 igtk[WPA_IGTK_MAX_LEN];
+++	size_t igtk_len;
+++};
+++#endif /* CONFIG_IEEE80211W */
++ 
++ /* WPA IE version 1
++  * 00-50-f2:1 (OUI:OUI type)
++diff -Naurp wpasupplicant-0.6.9.orig/src/rsn_supp/wpa.c wpasupplicant-0.6.9/src/rsn_supp/wpa.c
++--- wpasupplicant-0.6.9.orig/src/rsn_supp/wpa.c	2017-10-22 15:59:15.163356687 -0500
+++++ wpasupplicant-0.6.9/src/rsn_supp/wpa.c	2017-10-22 15:59:39.605252962 -0500
++@@ -621,6 +621,15 @@ static int wpa_supplicant_install_gtk(st
++ 	const u8 *_gtk = gd->gtk;
++ 	u8 gtk_buf[32];
++ 
+++	/* Detect possible key reinstallation */
+++	if (sm->gtk.gtk_len == (size_t) gd->gtk_len &&
+++	    os_memcmp(sm->gtk.gtk, gd->gtk, sm->gtk.gtk_len) == 0) {
+++		wpa_printf(MSG_DEBUG,
+++			"WPA: Not reinstalling already in-use GTK to the driver (keyidx=%d tx=%d len=%d)",
+++			gd->keyidx, gd->tx, gd->gtk_len);
+++		return 0;
+++	}
+++
++ 	wpa_hexdump_key(MSG_DEBUG, "WPA: Group Key", gd->gtk, gd->gtk_len);
++ 	wpa_printf(MSG_DEBUG, "WPA: Installing GTK to the driver "
++ 		   "(keyidx=%d tx=%d len=%d).", gd->keyidx, gd->tx,
++@@ -650,6 +659,10 @@ static int wpa_supplicant_install_gtk(st
++ 			   "the driver.");
++ 		return -1;
++ 	}
+++ 	os_memset(gtk_buf, 0, sizeof(gtk_buf));
+++
+++	sm->gtk.gtk_len = gd->gtk_len;
+++	os_memcpy(sm->gtk.gtk, gd->gtk, sm->gtk.gtk_len);
++ 
++ 	return 0;
++ }
++@@ -721,6 +734,47 @@ static int wpa_supplicant_pairwise_gtk(s
++ }
++ 
++ 
+++#ifdef CONFIG_IEEE80211W
+++static int wpa_supplicant_install_igtk(struct wpa_sm *sm,
+++				       const struct wpa_igtk_kde *igtk)
+++{
+++	u16 keyidx = WPA_GET_LE16(igtk->keyid);
+++
+++	/* Detect possible key reinstallation */
+++	if (sm->igtk.igtk_len == WPA_IGTK_LEN &&
+++	    os_memcmp(sm->igtk.igtk, igtk->igtk, sm->igtk.igtk_len) == 0) {
+++		wpa_printf(MSG_DEBUG,
+++			"WPA: Not reinstalling already in-use IGTK to the driver (keyidx=%d)",
+++			keyidx);
+++		return  0;
+++	}
+++
+++	wpa_printf(MSG_DEBUG,
+++		"WPA: IGTK keyid %d pn %02x%02x%02x%02x%02x%02x",
+++		keyidx, MAC2STR(igtk->pn));
+++	wpa_hexdump_key(MSG_DEBUG, "WPA: IGTK", igtk->igtk, WPA_IGTK_LEN);
+++	if (keyidx > 4095) {
+++		wpa_msg(sm->ctx->ctx, MSG_WARNING,
+++			"WPA: Invalid IGTK KeyID %d", keyidx);
+++		return -1;
+++	}
+++	if (wpa_sm_set_key(sm, WPA_ALG_IGTK,
+++			   (u8 *) "\xff\xff\xff\xff\xff\xff",
+++			   keyidx, 0, igtk->pn, sizeof(igtk->pn),
+++			   igtk->igtk, WPA_IGTK_LEN) < 0) {
+++		wpa_msg(sm->ctx->ctx, MSG_WARNING,
+++			"WPA: Failed to configure IGTK to the driver");
+++		return -1;
+++	}
+++
+++	sm->igtk.igtk_len = WPA_IGTK_LEN;
+++	os_memcpy(sm->igtk.igtk, igtk->igtk, sm->igtk.igtk_len);
+++
+++	return 0;
+++}
+++#endif /* CONFIG_IEEE80211W */
+++
+++
++ static int ieee80211w_set_keys(struct wpa_sm *sm,
++ 			       struct wpa_eapol_ie_parse *ie)
++ {
++@@ -730,29 +784,13 @@ static int ieee80211w_set_keys(struct wp
++ 
++ 	if (ie->igtk) {
++ 		const struct wpa_igtk_kde *igtk;
++-		u16 keyidx;
+++
++ 		if (ie->igtk_len != sizeof(*igtk))
++ 			return -1;
+++
++ 		igtk = (const struct wpa_igtk_kde *) ie->igtk;
++-		keyidx = WPA_GET_LE16(igtk->keyid);
++-		wpa_printf(MSG_DEBUG, "WPA: IGTK keyid %d "
++-			   "pn %02x%02x%02x%02x%02x%02x",
++-			   keyidx, MAC2STR(igtk->pn));
++-		wpa_hexdump_key(MSG_DEBUG, "WPA: IGTK",
++-				igtk->igtk, WPA_IGTK_LEN);
++-		if (keyidx > 4095) {
++-			wpa_printf(MSG_WARNING, "WPA: Invalid IGTK KeyID %d",
++-				   keyidx);
++-			return -1;
++-		}
++-		if (wpa_sm_set_key(sm, WPA_ALG_IGTK,
++-				   (u8 *) "\xff\xff\xff\xff\xff\xff",
++-				   keyidx, 0, igtk->pn, sizeof(igtk->pn),
++-				   igtk->igtk, WPA_IGTK_LEN) < 0) {
++-			wpa_printf(MSG_WARNING, "WPA: Failed to configure IGTK"
++-				   " to the driver");
+++		if (wpa_supplicant_install_igtk(sm, igtk) < 0)
++ 			return -1;
++-		}
++ 	}
++ 
++ 	return 0;
++@@ -1883,7 +1921,7 @@ void wpa_sm_deinit(struct wpa_sm *sm)
++  */
++ void wpa_sm_notify_assoc(struct wpa_sm *sm, const u8 *bssid)
++ {
++-	int clear_ptk = 1;
+++	int clear_keys = 1;
++ 
++ 	if (sm == NULL)
++ 		return;
++@@ -1903,18 +1941,24 @@ void wpa_sm_notify_assoc(struct wpa_sm *
++ 		/* Prepare for the next transition */
++ 		wpa_ft_prepare_auth_request(sm);
++ 
++-		clear_ptk = 0;
+++		clear_keys = 0;
++ 	}
++ #endif /* CONFIG_IEEE80211R */
++ 
++-	if (clear_ptk) {
+++	if (clear_keys) {
++ 		/*
++ 		 * IEEE 802.11, 8.4.10: Delete PTK SA on (re)association if
++ 		 * this is not part of a Fast BSS Transition.
++ 		 */
++ 		wpa_printf(MSG_DEBUG, "WPA: Clear old PTK");
++ 		sm->ptk_set = 0;
+++ 		os_memset(&sm->ptk, 0, sizeof(sm->ptk));
++ 		sm->tptk_set = 0;
+++ 		os_memset(&sm->tptk, 0, sizeof(sm->tptk));
+++		os_memset(&sm->gtk, 0, sizeof(sm->gtk));
+++#ifdef CONFIG_IEEE80211W
+++		os_memset(&sm->igtk, 0, sizeof(sm->igtk));
+++#endif /* CONFIG_IEEE80211W */
++ 	}
++ }
++ 
++diff -Naurp wpasupplicant-0.6.9.orig/src/rsn_supp/wpa_i.h wpasupplicant-0.6.9/src/rsn_supp/wpa_i.h
++--- wpasupplicant-0.6.9.orig/src/rsn_supp/wpa_i.h	2017-10-22 15:59:15.163356687 -0500
+++++ wpasupplicant-0.6.9/src/rsn_supp/wpa_i.h	2017-10-22 15:57:05.605249918 -0500
++@@ -33,6 +33,10 @@ struct wpa_sm {
++ 	u8 rx_replay_counter[WPA_REPLAY_COUNTER_LEN];
++ 	int rx_replay_counter_set;
++ 	u8 request_counter[WPA_REPLAY_COUNTER_LEN];
+++	struct wpa_gtk gtk;
+++#ifdef CONFIG_IEEE80211W
+++	struct wpa_igtk igtk;
+++#endif /* CONFIG_IEEE80211W */
++ 
++ 	struct eapol_sm *eapol; /* EAPOL state machine from upper level code */
++ 
+only in patch2:
+unchanged:
+--- hostapd-0.6.9.orig/debian/patches/2017-1/0009-FT-Do-not-allow-multiple-Reassociation-Response-fram.patch
++++ hostapd-0.6.9/debian/patches/2017-1/0009-FT-Do-not-allow-multiple-Reassociation-Response-fram.patch
+@@ -0,0 +1,82 @@
++This patch has been modified for compatibility with `wpasupplicant'
++from Ubuntu 10.04 LTS.
++
++Original message header below.
++===================================================================
++
++From dda06c8255d189bc951d81c67d29c6a378a705ba Mon Sep 17 00:00:00 2001
++From: Jouni Malinen <j@w1.fi>
++Date: Fri, 22 Sep 2017 12:06:37 +0300
++Subject: [PATCH 09/10] FT: Do not allow multiple Reassociation Response frames
++
++The driver is expected to not report a second association event without
++the station having explicitly request a new association. As such, this
++case should not be reachable. However, since reconfiguring the same
++pairwise or group keys to the driver could result in nonce reuse issues,
++be extra careful here and do an additional state check to avoid this
++even if the local driver ends up somehow accepting an unexpected
++Reassociation Response frame.
++
++Signed-off-by: Jouni Malinen <j@w1.fi>
++---
++ src/rsn_supp/wpa.c    | 3 +++
++ src/rsn_supp/wpa_ft.c | 8 ++++++++
++ src/rsn_supp/wpa_i.h  | 1 +
++ 3 files changed, 12 insertions(+)
++
++diff -Naurp wpasupplicant-0.6.9.orig/src/rsn_supp/wpa.c wpasupplicant-0.6.9/src/rsn_supp/wpa.c
++--- wpasupplicant-0.6.9.orig/src/rsn_supp/wpa.c	2017-10-22 23:18:52.770270950 -0500
+++++ wpasupplicant-0.6.9/src/rsn_supp/wpa.c	2017-10-22 23:17:36.302271923 -0500
++@@ -1975,6 +1975,9 @@ void wpa_sm_notify_disassoc(struct wpa_s
++ 	rsn_preauth_deinit(sm);
++ 	if (wpa_sm_get_state(sm) == WPA_4WAY_HANDSHAKE)
++ 		sm->dot11RSNA4WayHandshakeFailures++;
+++#ifdef CONFIG_IEEE80211R
+++	sm->ft_reassoc_completed = 0;
+++#endif /* CONFIG_IEEE80211R */
++ }
++ 
++ 
++diff -Naurp wpasupplicant-0.6.9.orig/src/rsn_supp/wpa_ft.c wpasupplicant-0.6.9/src/rsn_supp/wpa_ft.c
++--- wpasupplicant-0.6.9.orig/src/rsn_supp/wpa_ft.c	2017-10-22 23:18:52.770270950 -0500
+++++ wpasupplicant-0.6.9/src/rsn_supp/wpa_ft.c	2017-10-22 23:17:36.302271923 -0500
++@@ -128,6 +128,7 @@ static u8 * wpa_ft_gen_req_ies(struct wp
++ 	u16 capab;
++ 
++ 	sm->ft_completed = 0;
+++	sm->ft_reassoc_completed = 0;
++ 
++ 	buf_len = 2 + sizeof(struct rsn_mdie) + 2 + sizeof(struct rsn_ftie) +
++ 		2 + sm->r0kh_id_len + 100;
++@@ -746,6 +747,11 @@ int wpa_ft_validate_reassoc_resp(struct 
++ 		return -1;
++ 	}
++ 
+++	if (sm->ft_reassoc_completed) {
+++		wpa_printf(MSG_DEBUG, "FT: Reassociation has already been completed for this FT protocol instance - ignore unexpected retransmission");
+++		return 0;
+++	}
+++
++ 	if (wpa_ft_parse_ies(ies, ies_len, &parse) < 0) {
++ 		wpa_printf(MSG_DEBUG, "FT: Failed to parse IEs");
++ 		return -1;
++@@ -825,6 +831,8 @@ int wpa_ft_validate_reassoc_resp(struct 
++ 		return -1;
++ 	}
++ 
+++	sm->ft_reassoc_completed = 1;
+++
++ 	if (wpa_ft_process_gtk_subelem(sm, parse.gtk, parse.gtk_len) < 0)
++ 		return -1;
++ 
++diff -Naurp wpasupplicant-0.6.9.orig/src/rsn_supp/wpa_i.h wpasupplicant-0.6.9/src/rsn_supp/wpa_i.h
++--- wpasupplicant-0.6.9.orig/src/rsn_supp/wpa_i.h	2017-10-22 23:18:52.770270950 -0500
+++++ wpasupplicant-0.6.9/src/rsn_supp/wpa_i.h	2017-10-22 23:17:36.302271923 -0500
++@@ -107,6 +107,7 @@ struct wpa_sm {
++ 	size_t r0kh_id_len;
++ 	u8 r1kh_id[FT_R1KH_ID_LEN];
++ 	int ft_completed;
+++	int ft_reassoc_completed;
++ 	int over_the_ds_in_progress;
++ 	u8 target_ap[ETH_ALEN]; /* over-the-DS target AP */
++ #endif /* CONFIG_IEEE80211R */
+only in patch2:
+unchanged:
+--- hostapd-0.6.9.orig/debian/patches/2017-1/0004-Fix-PTK-rekeying-to-generate-a-new-ANonce.patch
++++ hostapd-0.6.9/debian/patches/2017-1/0004-Fix-PTK-rekeying-to-generate-a-new-ANonce.patch
+@@ -0,0 +1,66 @@
++This patch has been modified for compatibility with `wpasupplicant'
++from Ubuntu 10.04 LTS.
++
++Original message header below.
++===================================================================
++
++From dd1900d11c28a968cfc0d1f92153b2789bcbd686 Mon Sep 17 00:00:00 2001
++From: Jouni Malinen <j@w1.fi>
++Date: Sun, 1 Oct 2017 12:32:57 +0300
++Subject: [PATCH 04/10] Fix PTK rekeying to generate a new ANonce
++
++The Authenticator state machine path for PTK rekeying ended up bypassing
++the AUTHENTICATION2 state where a new ANonce is generated when going
++directly to the PTKSTART state since there is no need to try to
++determine the PMK again in such a case. This is far from ideal since the
++new PTK would depend on a new nonce only from the supplicant.
++
++Fix this by generating a new ANonce when moving to the PTKSTART state
++for the purpose of starting new 4-way handshake to rekey PTK.
++
++Signed-off-by: Jouni Malinen <j@w1.fi>
++---
++ src/ap/wpa_auth.c | 24 +++++++++++++++++++++---
++ 1 file changed, 21 insertions(+), 3 deletions(-)
++
++diff -Naurp hostapd-0.6.9.orig/hostapd/wpa.c hostapd-0.6.9/hostapd/wpa.c
++--- hostapd-0.6.9.orig/hostapd/wpa.c	2017-10-28 12:52:00.792106864 -0500
+++++ hostapd-0.6.9/hostapd/wpa.c	2017-10-28 12:51:16.782195846 -0500
++@@ -1297,6 +1297,21 @@ SM_STATE(WPA_PTK, AUTHENTICATION2)
++ }
++ 
++ 
+++static int wpa_auth_sm_ptk_update(struct wpa_state_machine *sm)
+++{
+++	if (os_get_random(sm->ANonce, WPA_NONCE_LEN)) {
+++		wpa_printf(MSG_ERROR,
+++			   "WPA: Failed to get random data for ANonce");
+++		sm->Disconnect = TRUE;
+++		return -1;
+++	}
+++	wpa_hexdump(MSG_DEBUG, "WPA: Assign new ANonce", sm->ANonce,
+++		    WPA_NONCE_LEN);
+++	sm->TimeoutCtr = 0;
+++	return 0;
+++}
+++
+++
++ SM_STATE(WPA_PTK, INITPMK)
++ {
++ 	u8 msk[2 * PMK_LEN];
++@@ -1680,9 +1695,12 @@ SM_STEP(WPA_PTK)
++ 		SM_ENTER(WPA_PTK, AUTHENTICATION);
++ 	else if (sm->ReAuthenticationRequest)
++ 		SM_ENTER(WPA_PTK, AUTHENTICATION2);
++-	else if (sm->PTKRequest)
++-		SM_ENTER(WPA_PTK, PTKSTART);
++-	else switch (sm->wpa_ptk_state) {
+++	else if (sm->PTKRequest) {
+++		if (wpa_auth_sm_ptk_update(sm) < 0)
+++			SM_ENTER(WPA_PTK, DISCONNECTED);
+++		else
+++			SM_ENTER(WPA_PTK, PTKSTART);
+++	} else switch (sm->wpa_ptk_state) {
++ 	case WPA_PTK_INITIALIZE:
++ 		break;
++ 	case WPA_PTK_DISCONNECT:

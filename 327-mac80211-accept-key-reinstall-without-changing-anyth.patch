@@ -1,0 +1,106 @@
+This patch has been modified for compatibility with Linux 2.6.32-47
+from Ubuntu 10.04 LTS.  (Technically, Trisquel 4.0 LTS "Taranis"
+to be more specific.)
+
+Original message header below.
+===================================================================
+
+From fdf7cb4185b60c68e1a75e61691c4afdc15dea0e Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Tue, 5 Sep 2017 14:54:54 +0200
+Subject: [PATCH] mac80211: accept key reinstall without changing anything
+
+When a key is reinstalled we can reset the replay counters
+etc. which can lead to nonce reuse and/or replay detection
+being impossible, breaking security properties, as described
+in the "KRACK attacks".
+
+In particular, CVE-2017-13080 applies to GTK rekeying that
+happened in firmware while the host is in D3, with the second
+part of the attack being done after the host wakes up. In
+this case, the wpa_supplicant mitigation isn't sufficient
+since wpa_supplicant doesn't know the GTK material.
+
+In case this happens, simply silently accept the new key
+coming from userspace but don't take any action on it since
+it's the same key; this keeps the PN replay counters intact.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+---
+ net/mac80211/key.c | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff -Naurp linux-2.6.32.orig/net/mac80211/key.c linux-2.6.32/net/mac80211/key.c
+--- linux-2.6.32.orig/net/mac80211/key.c	2009-12-02 21:51:21.000000000 -0600
++++ linux-2.6.32/net/mac80211/key.c	2017-10-24 21:40:52.286337489 -0500
+@@ -393,9 +393,6 @@ void ieee80211_key_link(struct ieee80211
+ 	BUG_ON(!key);
+ 
+ 	idx = key->conf.keyidx;
+-	key->local = sdata->local;
+-	key->sdata = sdata;
+-	key->sta = sta;
+ 
+ 	if (sta) {
+ 		/*
+@@ -421,7 +418,7 @@ void ieee80211_key_link(struct ieee80211
+ 			 */
+ 
+ 			/* same here, the AP could be using QoS */
+-			ap = sta_info_get(key->local, key->sdata->u.mgd.bssid);
++			ap = sta_info_get(sdata->local, sdata->u.mgd.bssid);
+ 			if (ap) {
+ 				if (test_sta_flags(ap, WLAN_STA_WME))
+ 					key->conf.flags |=
+@@ -437,6 +434,20 @@ void ieee80211_key_link(struct ieee80211
+ 	else
+ 		old_key = sdata->keys[idx];
+ 
++	/*
++	 * Silently accept key re-installation without really installing the
++	 * new version of the key to avoid nonce reuse or replay issues.
++	 */
++	if (old_key && key->conf.keylen == old_key->conf.keylen &&
++	    !memcmp(key->conf.key, old_key->conf.key, key->conf.keylen)) {
++		ieee80211_key_free_unused(key);
++		goto out;
++	}
++
++	key->local = sdata->local;
++	key->sdata = sdata;
++	key->sta = sta;
++
+ 	__ieee80211_key_replace(sdata, sta, old_key, key);
+ 
+ 	/* free old key later */
+@@ -446,6 +457,7 @@ void ieee80211_key_link(struct ieee80211
+ 	if (netif_running(sdata->dev))
+ 		add_todo(key, KEY_FLAG_TODO_HWACCEL_ADD);
+ 
++ out:
+ 	spin_unlock_irqrestore(&sdata->local->key_lock, flags);
+ }
+ 
+@@ -598,6 +610,12 @@ static void __ieee80211_key_todo(void)
+ 	spin_unlock_bh(&todo_lock);
+ }
+ 
++void ieee80211_key_free_unused(struct ieee80211_key *key)
++{
++	WARN_ON(key->sdata || key->local);
++	__ieee80211_key_destroy(key);
++}
++
+ void ieee80211_key_todo(void)
+ {
+ 	ieee80211_key_lock();
+diff -Naurp linux-2.6.32.orig/net/mac80211/key.h linux-2.6.32/net/mac80211/key.h
+--- linux-2.6.32.orig/net/mac80211/key.h	2009-12-02 21:51:21.000000000 -0600
++++ linux-2.6.32/net/mac80211/key.h	2017-10-24 00:36:43.763426960 -0500
+@@ -162,5 +162,6 @@ void ieee80211_enable_keys(struct ieee80
+ void ieee80211_disable_keys(struct ieee80211_sub_if_data *sdata);
+ 
+ void ieee80211_key_todo(void);
++void ieee80211_key_free_unused(struct ieee80211_key *key);
+ 
+ #endif /* IEEE80211_KEY_H */
